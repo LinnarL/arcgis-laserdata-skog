@@ -39,10 +39,29 @@ never has to open the point cloud.
 | Utdata-arbetsyta | project geodatabase | Geodatabase or folder. In a folder the rasters are GeoTIFF |
 | Namnprefix | `laser` | Outputs are `<prefix>_dsm`, `<prefix>_dtm`, `<prefix>_hojdskillnad`. Existing ones are overwritten, with a warning in the dialog |
 | Cellstorlek (m) | 1 | Under Avancerat |
-| Största tillåtna yta (km²) | 10 | Under Avancerat. All points are held in memory, about 300 MB per km² of bounding box |
+| Största tillåtna yta (km²) | 10 | Under Avancerat. All points are held in memory, about 100-150 MB per km² of bounding box |
+| Mapp för punktfiler | - | Under Spara punkter. Optional. Saves the points read, one file per tile: `<prefix>_<tile>.laz` or `.las`. Only the area's bounding box, not whole tiles, all classes including noise |
+| Format för punktfiler | LAZ | LAZ is 5-7 times smaller but cannot be opened in Pro on a Basic licence. LAS can be added straight to a map |
+
+Every parameter has a tooltip in the dialog. The text lives in `TOOLTIPS` in the `.pyt`, which
+writes it to `LaserdataSkog.HojdmodellerFranLaserdata.pyt.xml` when the toolbox loads.
+
+## Output
 
 The rasters are clipped to the polygon, snapped to whole multiples of the cell size, in
 SWEREF 99 TM + RH 2000, and added to the active map.
+
+Each raster gets item metadata (Catalog, View Metadata): title with capture dates, a table of
+the source tiles with scanning area, capture period, flying height, nominal point density and
+last processing date, the processing method and point counts, credits to Lantmäteriet and a
+link to the terms of use.
+
+## Progress
+
+The run is split into numbered steps shown in the progress bar and the messages. Tiles are read
+one at a time with `Ruta k av n` and an estimate of the time left, based on the point count
+Lantmäteriet publishes per tile. Building the DSM and DTM are single PDAL calls with no internal
+progress. The message names the step and the number of points instead.
 
 ## About the data
 
@@ -52,5 +71,7 @@ SWEREF 99 TM + RH 2000, and added to the active map.
 - The DSM is NoData where no laser returns exist, typically open water. The DTM interpolates
   across such areas.
 - If Lantmäteriet has scanned a tile more than once, the newest scan is used. When an area spans
-  tiles from different years, the tool warns that the height difference may show a seam.
+  tiles scanned on different dates, the tool warns that the height difference may show a seam.
+  Neighbouring tiles can differ by weeks or seasons, and leaf-off scans give lower and sparser
+  deciduous crowns.
 - Coverage is about 75 % of Sweden. The mountains are not included.

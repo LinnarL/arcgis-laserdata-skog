@@ -4,7 +4,8 @@ LaserdataSkog.pyt
 
 Skapar tre höjdraster för ett intresseområde ur Lantmäteriets Laserdata
 Nedladdning, skog: ytmodell (DSM), markmodell (DTM) och höjdskillnaden mellan
-dem (DSM - DTM, i praktiken vegetationshöjd).
+dem (DSM - DTM, i praktiken vegetationshöjd). Kan även spara de lästa punkterna
+som LAZ eller LAS.
 
 Datakälla
 ---------
@@ -17,7 +18,7 @@ STAC-katalog (öppen, ingen inloggning):
 Varje item är en ruta på 10 x 10 km i SWEREF 99 TM + RH 2000 (EPSG:5845),
 med en asset "data" som pekar på en COPC-fil (.copc.laz, ~1 GB):
     https://dl1.lantmateriet.se/hojd/data/pointcloud/sls/<område>/m<id>.copc.laz
-proj:bbox på asset/properties ger rutans hörn i SWEREF 99 TM.
+proj:bbox ger rutans hörn i SWEREF 99 TM, pc:count antalet punkter i rutan.
 
 Nedladdning kräver OAuth2 (client credentials):
     POST https://apimanager.lantmateriet.se/oauth2/token
@@ -31,15 +32,24 @@ intresseområdets utbredning. PDAL:s curl i Pro saknar CA-certifikat, så
 ARBITER_CA_INFO pekas mot certifi innan pdal importeras - utan det fastnar
 varje HTTPS-anrop i ett oändligt omförsök.
 
+Rutorna läses en i taget, så att förloppet kan visas per ruta med en
+uppskattning av återstående tid (från pc:count och den uppmätta hastigheten).
+
 Klasser: 1 oklassad, 2 mark, 7 lågt brus, 18 högt brus. Brus tas bort före
-allt annat. DSM = högsta punkt per cell, små luckor fylls från grannceller.
-DTM = markpunkter trianguleras (TIN) och rastreras, alltså utan luckor.
+rastren men sparas i punktfilerna. DSM = högsta punkt per cell, små luckor
+fylls från grannceller. DTM = markpunkter trianguleras (TIN) och rastreras,
+alltså utan luckor.
+
+Verktygstips (parameterförklaringar) skrivs till
+LaserdataSkog.HojdmodellerFranLaserdata.pyt.xml från TOOLTIPS nedan när
+verktygslådan laddas, så att texten bara finns på ett ställe.
 
 Krav: ArcGIS Pro 3.x. arcpy, numpy, pdal och certifi ingår i arcgispro-py3.
 Ingen licensnivå utöver Basic behövs.
 """
 
 import base64
+import datetime
 import json
 import math
 import os
@@ -47,6 +57,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from xml.sax.saxutils import escape
 
 import arcpy
 import numpy as np
@@ -58,18 +69,21 @@ TOKEN_URL = "https://apimanager.lantmateriet.se/oauth2/token"
 COLLECTION = "dsm-skoglig-copc"
 GEOTORGET_URL = "https://geotorget.lantmateriet.se/geodataprodukter/laserdata-nedladdning-skog-api"
 
-USER_AGENT = "arcgis-laserdata-skog/1.0"
+USER_AGENT = "arcgis-laserdata-skog/1.1"
 HTTP_TIMEOUT = 60
 HTTP_RETRIES = 3
 
+# Token gäller 3600 s. Hämta en ny innan nästa ruta om den är äldre än så här.
+TOKEN_MAX_AGE_S = 50 * 60
+
 SWEREF99TM_WKID = 3006
 RH2000_WKID = 5613
-WGS84_WKID = 4326
+PC_SRS = "EPSG:5845"  # SWEREF 99 TM + RH 2000, samma som källfilerna
 
 NODATA = -9999.0
 
 CLASS_GROUND = 2
-NOISE_LIMITS = "Classification![7:7],Classification![18:18]"
+NOISE_CLASSES = (7, 18)
 
 # Punkter läses med denna marginal runt området, så att TIN:en och DSM:ens
 # lucköppning inte får sämre underlag vid kanten.
@@ -78,12 +92,124 @@ READ_MARGIN_M = 20.0
 # Luckor i DSM mindre än så här många celler fylls med IDW från grannar.
 DSM_WINDOW = 3
 
+# Uppmätt: 51 byte per punkt i numpy-arrayen. Under läsningen av en ruta håller
+# PDAL en egen kopia av just den rutans punkter.
+BYTES_PER_POINT = 51
+
 DEFAULT_CELL_SIZE = 1.0
 DEFAULT_MAX_AREA_KM2 = 10.0
 
 SUFFIX_DSM = "dsm"
 SUFFIX_DTM = "dtm"
 SUFFIX_DIFF = "hojdskillnad"
+
+RAW_LAZ = "LAZ (komprimerad)"
+RAW_LAS = "LAS (okomprimerad, kan öppnas i ArcGIS Pro)"
+RAW_EXT = {RAW_LAZ: ".laz", RAW_LAS: ".las"}
+
+# Mappar som synkas till molnet - olämpliga för stora punktfiler
+_SYNC_HINTS = ("onedrive", "sharepoint", "dropbox", "google drive")
+
+TOOL_SUMMARY = (
+    "Skapar ytmodell (DSM), markmodell (DTM) och höjdskillnad (DSM - DTM) för ett "
+    "intresseområde ur Lantmäteriets Laserdata Nedladdning, skog. Bara punkterna inom "
+    "områdets utbredning hämtas, hela rutor laddas aldrig ned. Punkterna kan även sparas "
+    "som LAZ eller LAS."
+)
+
+# Verktygstips per parameter, visas i verktygsdialogen. Se _write_tool_metadata.
+TOOLTIPS = {
+    "aoi": (
+        "Polygonlager som avgränsar området. Alla objekt i lagret slås ihop, eller bara de "
+        "valda om det finns ett urval. Lagret kan ha vilket koordinatsystem som helst. "
+        "Punkter hämtas inom polygonernas utbredning (bounding box), rastren klipps sedan "
+        "till själva polygonerna."
+    ),
+    "consumer_key": (
+        "Consumer key från Lantmäteriets API-portal. Nyckeln behöver både API:et STAC-hojd "
+        "och en beställning av Laserdata Nedladdning, skog på Geotorget."
+    ),
+    "consumer_secret": (
+        "Consumer secret som hör till nyckeln. Visas dold i dialogen och skrivs aldrig till "
+        "meddelandena."
+    ),
+    "out_workspace": (
+        "Geodatabas eller mapp där de tre rastren sparas. I en mapp blir de GeoTIFF."
+    ),
+    "prefix": (
+        "Början på utdatanamnen: <prefix>_dsm, <prefix>_dtm och <prefix>_hojdskillnad. "
+        "Befintliga raster med samma namn skrivs över. Bara bokstäver, siffror och "
+        "understreck, och första tecknet måste vara en bokstav."
+    ),
+    "cell_size": (
+        "Rastrens cellstorlek i meter. Punkttätheten är 1-2 punkter per m², varav ungefär "
+        "en markpunkt per m² i öppen skog, så 1 m är ett bra standardval. Mindre celler "
+        "ger en glest fylld DSM."
+    ),
+    "max_area_km2": (
+        "Skydd mot att råka välja ett för stort område. Alla punkter hålls i minnet medan "
+        "rastren skapas, ungefär 100-150 MB per km² av områdets utbredning. Höj gränsen om "
+        "datorn har minne nog."
+    ),
+    "raw_folder": (
+        "Valfritt. Mapp där de lästa punkterna sparas, en fil per ruta med namnet "
+        "<prefix>_<ruta>.laz eller .las. Filerna innehåller alla punkter inom områdets "
+        "utbredning (inte hela rutor) med alla klasser, även brus. Lämna tomt för att inte "
+        "spara några punkter. Undvik mappar som synkas till molnet, som OneDrive."
+    ),
+    "raw_format": (
+        "Filformat för sparade punkter. LAZ är ungefär 5-7 gånger mindre men kan inte "
+        "öppnas i ArcGIS Pro med en Basic-licens. LAS kan läggas till direkt i en karta "
+        "men tar mer plats, ungefär 30 byte per punkt."
+    ),
+    "out_dsm": "Ytmodellen: högsta punkt per cell, klippt till intresseområdet.",
+    "out_dtm": "Markmodellen: triangulerad från markpunkterna, klippt till intresseområdet.",
+    "out_hojdskillnad": (
+        "DSM minus DTM, i praktiken vegetationens och byggnadernas höjd. Negativa värden "
+        "(mätbrus) sätts till 0."
+    ),
+}
+
+
+# =============================================================================
+# Förlopp
+# =============================================================================
+
+def _fmt_duration(seconds):
+    seconds = max(0, int(round(seconds)))
+    if seconds < 60:
+        return "{} s".format(seconds)
+    if seconds < 3600:
+        return "{} min".format(int(round(seconds / 60.0)))
+    return "{} h {} min".format(seconds // 3600, (seconds % 3600) // 60)
+
+
+def _fmt_count(n):
+    return "{:,}".format(int(n)).replace(",", " ")
+
+
+class _Steps:
+    """Numrerade steg i förloppsindikatorn och i meddelandena."""
+
+    def __init__(self, total, messages):
+        self.total = total
+        self.messages = messages
+        self.k = 0
+        self.t0 = time.time()
+
+    def next(self, text):
+        self.k += 1
+        self.t_step = time.time()
+        label = "Steg {} av {}: {}".format(self.k, self.total, text)
+        arcpy.SetProgressor("default", label)
+        self.messages.addMessage(label)
+
+    def label(self, text):
+        arcpy.SetProgressorLabel("Steg {} av {}: {}".format(self.k, self.total, text))
+
+    def done(self, text=None):
+        msg = "    klart på {}".format(_fmt_duration(time.time() - self.t_step))
+        self.messages.addMessage(msg + (". " + text if text else "."))
 
 
 # =============================================================================
@@ -222,8 +348,9 @@ def _pick_tiles(items, aoi):
     sr = arcpy.SpatialReference(SWEREF99TM_WKID)
     newest = {}
     for it in items:
+        props = it.get("properties", {})
         asset = it.get("assets", {}).get("data")
-        pb = it.get("properties", {}).get("proj:bbox") or (asset or {}).get("proj:bbox")
+        pb = props.get("proj:bbox") or (asset or {}).get("proj:bbox")
         if not asset or not pb:
             continue
         xmin, ymin, xmax, ymax = pb[:4]
@@ -233,11 +360,44 @@ def _pick_tiles(items, aoi):
         if aoi.disjoint(rect):
             continue
         key = tuple(round(v) for v in pb[:4])
-        dt = it.get("properties", {}).get("datetime") or ""
+        dt = props.get("datetime") or ""
         if key not in newest or dt > newest[key]["datetime"]:
             newest[key] = {"id": it["id"], "href": asset["href"], "datetime": dt,
-                           "size": asset.get("file:size") or 0}
+                           "bbox": (xmin, ymin, xmax, ymax),
+                           "count": props.get("pc:count") or 0,
+                           "start": props.get("start_datetime") or dt,
+                           "end": props.get("end_datetime") or dt,
+                           "area": props.get("skanningsomrade") or "",
+                           "flyghojd": props.get("flyghojd"),
+                           "punkttathet": props.get("punkttathet"),
+                           "modified": props.get("data_modified") or ""}
     return sorted(newest.values(), key=lambda t: t["id"])
+
+
+def _capture_period(tile):
+    """'2021-03-07 - 2021-04-01', eller ett enda datum om start och slut är samma dag."""
+    start, last = tile["start"][:10], tile["end"][:10]
+    if not start:
+        return "okänt"
+    # end_datetime är midnatt efter sista flygdagen (2021-04-17T00 - 2021-04-18T00
+    # är en enda dag), så backa en dag när slutet ligger på midnatt.
+    if last > start and tile["end"][11:19] == "00:00:00":
+        try:
+            last = (datetime.date.fromisoformat(last) - datetime.timedelta(days=1)).isoformat()
+        except ValueError:
+            pass
+    return start if last in ("", start) else "{} - {}".format(start, last)
+
+
+def _read_bounds(tile, extent):
+    """Områdets utbredning (med marginal) snittad med rutan, och andelen av rutan."""
+    xmin, ymin, xmax, ymax = tile["bbox"]
+    bx0 = max(xmin, extent.XMin - READ_MARGIN_M)
+    bx1 = min(xmax, extent.XMax + READ_MARGIN_M)
+    by0 = max(ymin, extent.YMin - READ_MARGIN_M)
+    by1 = min(ymax, extent.YMax + READ_MARGIN_M)
+    frac = max(0.0, (bx1 - bx0) * (by1 - by0)) / ((xmax - xmin) * (ymax - ymin))
+    return "([{:.2f},{:.2f}],[{:.2f},{:.2f}])".format(bx0, bx1, by0, by1), frac
 
 
 # =============================================================================
@@ -263,47 +423,51 @@ def _import_pdal():
     return pdal
 
 
-def _read_points(pdal, tiles, token, extent):
-    bounds = "([{:.2f},{:.2f}],[{:.2f},{:.2f}])".format(
-        extent.XMin - READ_MARGIN_M, extent.XMax + READ_MARGIN_M,
-        extent.YMin - READ_MARGIN_M, extent.YMax + READ_MARGIN_M)
-    stages = [{
+def _read_tile(pdal, tile, token, bounds):
+    """Alla punkter i rutan inom bounds, alla klasser."""
+    stage = {
         "type": "readers.copc",
-        "filename": {"path": t["href"], "headers": {"Authorization": "Bearer " + token}},
+        "filename": {"path": tile["href"], "headers": {"Authorization": "Bearer " + token}},
         "bounds": bounds,
-        "tag": "r{}".format(i),
-    } for i, t in enumerate(tiles)]
-    # Utan explicita inputs tar ett filter bara steget närmast före, så alla
-    # läsare utom den sista skulle tyst falla bort.
-    stages.append({"type": "filters.merge", "inputs": [s["tag"] for s in stages]})
-    stages.append({"type": "filters.range", "limits": NOISE_LIMITS})
-    pipe = pdal.Pipeline(json.dumps(stages))
+    }
+    pipe = pdal.Pipeline(json.dumps([stage]))
     pipe.execute()
     arrays = pipe.arrays
     return arrays[0] if len(arrays) == 1 else np.concatenate(arrays)
 
 
-def _write_dsm(pdal, points, grid, path):
-    stage = {"type": "writers.gdal", "filename": path, "output_type": "max",
-             "window_size": DSM_WINDOW, "data_type": "float32", "nodata": NODATA}
-    stage.update(grid)
+def _write_points(pdal, points, path):
+    # Tillägget avgör formatet: .laz komprimeras, .las blir okomprimerad.
+    # Från en numpy-array har PDAL inget koordinatsystem, så det sätts här.
+    stage = {"type": "writers.las", "filename": path, "minor_version": 4,
+             "extra_dims": "all", "a_srs": PC_SRS}
     pdal.Pipeline(json.dumps([stage]), arrays=[points]).execute()
 
 
-def _write_dtm(pdal, points, grid, path):
+def _write_dsm(pdal, arrays, grid, path):
+    # writers.gdal lägger flera arrayer i samma rutnät, så rutorna behöver inte
+    # slås ihop först (det skulle dubbla minnesåtgången en stund).
+    stage = {"type": "writers.gdal", "filename": path, "output_type": "max",
+             "window_size": DSM_WINDOW, "data_type": "float32", "nodata": NODATA}
+    stage.update(grid)
+    pdal.Pipeline(json.dumps([stage]), arrays=arrays).execute()
+
+
+def _write_dtm(pdal, ground, grid, path):
+    # En enda array: filters.delaunay trianguerar varje array för sig, och
+    # separata rutor skulle ge en lucka längs rutgränsen.
     face = {"type": "filters.faceraster"}
     face.update(grid)
     stages = [
-        {"type": "filters.range", "limits": "Classification[{0}:{0}]".format(CLASS_GROUND)},
         {"type": "filters.delaunay"},
         face,
         {"type": "writers.raster", "filename": path, "data_type": "float32", "nodata": NODATA},
     ]
-    pdal.Pipeline(json.dumps(stages), arrays=[points]).execute()
+    pdal.Pipeline(json.dumps(stages), arrays=[ground]).execute()
 
 
 # =============================================================================
-# Utdata
+# Utdata och metadata
 # =============================================================================
 
 def _out_path(workspace, prefix, suffix):
@@ -335,6 +499,130 @@ def _add_to_map(paths, messages):
         m.addDataFromPath(p)
 
 
+_PRODUCTS = {
+    SUFFIX_DSM: (
+        "Ytmodell (DSM)",
+        "Högsta laserpunkt per cell, alla klasser utom brus (7, 18). Celler utan punkter "
+        "fylls med IDW från grannceller inom {} celler; större luckor, typiskt öppet vatten, "
+        "är NoData.".format(DSM_WINDOW),
+    ),
+    SUFFIX_DTM: (
+        "Markmodell (DTM)",
+        "Markpunkter (klass 2) triangulerade till ett TIN och rastrerade. Modellen saknar "
+        "luckor; där markpunkter saknas, t.ex. över vatten, är värdet interpolerat.",
+    ),
+    SUFFIX_DIFF: (
+        "Höjdskillnad (DSM - DTM)",
+        "Ytmodellen minus markmodellen, i praktiken vegetationens och byggnadernas höjd över "
+        "mark. Negativa värden (mätbrus) är satta till 0. NoData där DSM saknar värde.",
+    ),
+}
+
+TERMS_URL = ("https://www.lantmateriet.se/globalassets/geodata/geodataprodukter/"
+             "anvandningsvillkor-for-laserdata-nedladdning-skog.pdf")
+
+
+def _write_raster_metadata(path, suffix, tiles, run):
+    """Titel, beskrivning, källrutor med insamlingsdatum, villkor och taggar."""
+    title, method = _PRODUCTS[suffix]
+    h = escape
+    rows = "".join(
+        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
+            h(t["id"]), h(t["area"]), h(_capture_period(t)),
+            "{} m".format(t["flyghojd"]) if t["flyghojd"] else "",
+            "{} p/m²".format(t["punkttathet"]) if t["punkttathet"] else "",
+            h(t["modified"][:10]))
+        for t in tiles)
+    periods = sorted({_capture_period(t) for t in tiles})
+    ext = run["extent"]
+    desc = (
+        "<p>{method}</p>"
+        "<p><b>Källa:</b> Lantmäteriet, Laserdata Nedladdning, skog (STAC-samling "
+        "{coll}, {n} ruta/rutor). Flygburen laserskanning, klassificerat punktmoln.</p>"
+        "<p><b>Insamlingsdatum:</b> {periods}. Årstiden påverkar vegetationshöjden: "
+        "skanning utan löv kan ge lägre och glesare lövträdskronor än sommartid.</p>"
+        "<table border='1' cellpadding='3'><tr><th>Ruta</th><th>Skanningsområde</th>"
+        "<th>Insamlad</th><th>Flyghöjd</th><th>Punkttäthet (nominell)</th>"
+        "<th>Punktmoln senast ändrat</th></tr>{rows}</table>"
+        "<p><b>Bearbetning:</b> Cellstorlek {cell:g} m. {npts} punkter lästa inom "
+        "områdets utbredning, varav {nground} markpunkter. Klippt till intresseområdet. "
+        "Skapad {created} med verktyget {tool} (arcgis-laserdata-skog).</p>"
+        "<p><b>Koordinatsystem:</b> SWEREF 99 TM (EPSG:3006), höjder i meter i RH 2000 "
+        "(EPSG:5613).</p>"
+        "<p><b>Utbredning:</b> X {x0:.0f} - {x1:.0f}, Y {y0:.0f} - {y1:.0f}.</p>"
+    ).format(method=h(method), coll=COLLECTION, n=len(tiles), periods=h(", ".join(periods)),
+             rows=rows, cell=run["cell"], npts=_fmt_count(run["points"]),
+             nground=_fmt_count(run["ground"]), created=run["created"],
+             tool=h(HojdmodellerFranLaserdata().label),
+             x0=ext.XMin, x1=ext.XMax, y0=ext.YMin, y1=ext.YMax)
+
+    md = arcpy.metadata.Metadata(path)
+    md.title = "{} från Laserdata Skog, {}".format(title, ", ".join(periods))
+    md.summary = "{} i {:g} m upplösning ur Lantmäteriets Laserdata Nedladdning, skog, " \
+                 "insamlad {}.".format(title, run["cell"], ", ".join(periods))
+    md.description = desc
+    md.tags = "Lantmäteriet, Laserdata Skog, laserskanning, höjdmodell, {}".format(
+        {SUFFIX_DSM: "DSM, ytmodell", SUFFIX_DTM: "DTM, markmodell",
+         SUFFIX_DIFF: "vegetationshöjd, höjdskillnad"}[suffix])
+    md.credits = "© Lantmäteriet, Laserdata Nedladdning, skog."
+    md.accessConstraints = (
+        "Användningsvillkor för Laserdata Nedladdning, skog: {}".format(TERMS_URL))
+    md.save()
+
+
+def _write_tool_metadata(tool_cls, toolbox_alias):
+    """
+    Skriv verktygets metadatafil med parameterförklaringar från TOOLTIPS.
+
+    Pro läser verktygstipsen i dialogen från <verktygslåda>.<verktyg>.pyt.xml
+    (elementet dialogReference per parameter). Det finns inget attribut på
+    arcpy.Parameter för detta. Filen skrivs bara om innehållet har ändrats.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    toolbox = os.path.splitext(os.path.basename(__file__))[0]
+    path = os.path.join(here, "{}.{}.pyt.xml".format(toolbox, tool_cls.__name__))
+
+    def html(text):
+        body = escape(text).replace("\n", "</SPAN></P><P><SPAN>")
+        return escape('<DIV STYLE="text-align:Left;"><P><SPAN>{}</SPAN></P></DIV>'.format(body))
+
+    tool = tool_cls()
+    params = []
+    for p in tool.getParameterInfo():
+        tip = TOOLTIPS.get(p.name)
+        if not tip:
+            continue
+        params.append(
+            '<param name="{n}" displayname="{d}" type="{t}" direction="{r}">'
+            "<dialogReference>{h}</dialogReference>"
+            "<pythonReference>{h}</pythonReference></param>".format(
+                n=p.name, d=escape(p.displayName, {'"': "&quot;"}),
+                t=p.parameterType, r=p.direction, h=html(tip))
+        )
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<metadata xml:lang="sv"><Esri><ArcGISFormat>1.0</ArcGISFormat></Esri>'
+        '<tool name="{name}" displayname="{label}" toolboxalias="{alias}" xmlns="">'
+        "<parameters>{params}</parameters><summary>{summary}</summary></tool>"
+        "<dataIdInfo><idCitation><resTitle>{label}</resTitle></idCitation>"
+        "<idAbs>{summary}</idAbs></dataIdInfo></metadata>\n"
+    ).format(name=tool_cls.__name__, label=escape(tool.label), alias=toolbox_alias,
+             params="".join(params), summary=html(TOOL_SUMMARY))
+
+    try:
+        with open(path, encoding="utf-8") as fh:
+            if fh.read() == xml:
+                return
+    except OSError:
+        pass
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(xml)
+    except OSError:
+        # Skrivskyddad plats: verktyget fungerar ändå, bara utan verktygstips.
+        pass
+
+
 # =============================================================================
 # Toolbox
 # =============================================================================
@@ -344,16 +632,14 @@ class Toolbox:
         self.label = "Lantmäteriet Laserdata Skog"
         self.alias = "laserdata_skog"
         self.tools = [HojdmodellerFranLaserdata]
+        _write_tool_metadata(HojdmodellerFranLaserdata, self.alias)
 
 
 class HojdmodellerFranLaserdata:
     def __init__(self):
         self.label = "Höjdmodeller från Laserdata Skog"
-        self.description = (
-            "Skapar ytmodell (DSM), markmodell (DTM) och höjdskillnad (DSM - DTM) för "
-            "ett intresseområde ur Lantmäteriets Laserdata Nedladdning, skog. Bara "
-            "punkterna inom områdets utbredning hämtas, hela rutor laddas aldrig ned. "
-            "Kräver en consumer key och secret från Lantmäteriets API-portal med "
+        self.description = TOOL_SUMMARY + (
+            " Kräver en consumer key och secret från Lantmäteriets API-portal med "
             "behörighet till STAC-hojd och Laserdata Nedladdning, skog."
         )
         self.canRunInBackground = False
@@ -400,6 +686,19 @@ class HojdmodellerFranLaserdata:
         )
         p_max.value = DEFAULT_MAX_AREA_KM2
 
+        p_raw = arcpy.Parameter(
+            displayName="Mapp för punktfiler", name="raw_folder", datatype="DEFolder",
+            parameterType="Optional", direction="Input", category="Spara punkter",
+        )
+        p_raw_fmt = arcpy.Parameter(
+            displayName="Format för punktfiler", name="raw_format", datatype="GPString",
+            parameterType="Optional", direction="Input", category="Spara punkter",
+        )
+        p_raw_fmt.filter.type = "ValueList"
+        p_raw_fmt.filter.list = [RAW_LAZ, RAW_LAS]
+        p_raw_fmt.value = RAW_LAZ
+        p_raw_fmt.enabled = False
+
         p_out = [
             arcpy.Parameter(displayName=label, name="out_" + suffix, datatype="DERasterDataset",
                             parameterType="Derived", direction="Output")
@@ -407,16 +706,20 @@ class HojdmodellerFranLaserdata:
                                   ("Höjdskillnad", SUFFIX_DIFF))
         ]
 
-        return [p_aoi, p_key, p_secret, p_ws, p_prefix, p_cell, p_max] + p_out
+        # Nya parametrar läggs efter de gamla, så att skript som anropar
+        # verktyget med positionsargument fortsätter att fungera.
+        return [p_aoi, p_key, p_secret, p_ws, p_prefix, p_cell, p_max,
+                p_raw, p_raw_fmt] + p_out
 
     def isLicensed(self):
         return True
 
     def updateParameters(self, parameters):
-        return
+        p_raw, p_raw_fmt = parameters[7], parameters[8]
+        p_raw_fmt.enabled = bool(p_raw.valueAsText)
 
     def updateMessages(self, parameters):
-        p_ws, p_prefix, p_cell, p_max = parameters[3:7]
+        p_ws, p_prefix, p_cell, p_max, p_raw = parameters[3:8]
 
         prefix = (p_prefix.valueAsText or "").strip()
         if prefix and not (prefix[0].isalpha() and all(c.isalnum() or c == "_" for c in prefix)):
@@ -442,6 +745,13 @@ class HojdmodellerFranLaserdata:
         if p_max.value is not None and p_max.value <= 0:
             p_max.setErrorMessage("Ange en yta större än 0.")
 
+        raw = (p_raw.valueAsText or "").lower()
+        if raw and any(h in raw for h in _SYNC_HINTS):
+            p_raw.setWarningMessage(
+                "Mappen ser ut att synkas till molnet. Punktfilerna kan bli flera GB och "
+                "skulle då laddas upp."
+            )
+
     def execute(self, parameters, messages):
         aoi = parameters[0].value
         key = (parameters[1].valueAsText or "").strip()
@@ -450,15 +760,18 @@ class HojdmodellerFranLaserdata:
         prefix = parameters[4].valueAsText.strip()
         cell = parameters[5].value or DEFAULT_CELL_SIZE
         max_area = parameters[6].value or DEFAULT_MAX_AREA_KM2
+        raw_folder = parameters[7].valueAsText or None
+        raw_ext = RAW_EXT.get(parameters[8].valueAsText or RAW_LAZ, ".laz")
 
         try:
-            outputs = _run(aoi, key, secret, workspace, prefix, cell, max_area, messages)
+            outputs = _run(aoi, key, secret, workspace, prefix, cell, max_area,
+                           raw_folder, raw_ext, messages)
         except ValueError as exc:
             messages.addErrorMessage(str(exc))
             raise arcpy.ExecuteError
 
         for i, path in enumerate(outputs):
-            arcpy.SetParameterAsText(7 + i, path)
+            arcpy.SetParameterAsText(9 + i, path)
 
     def postExecute(self, parameters):
         return
@@ -468,7 +781,8 @@ class HojdmodellerFranLaserdata:
 # Körningens innehåll (separat funktion - går att testa utanför Pro)
 # =============================================================================
 
-def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2, messages):
+def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2,
+         raw_folder, raw_ext, messages):
     aoi = _aoi_geometry(aoi_layer)
     ext = aoi.extent
     area_km2 = (ext.XMax - ext.XMin) * (ext.YMax - ext.YMin) / 1e6
@@ -476,13 +790,16 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2, messages
     if area_km2 > max_area_km2:
         raise ValueError(
             "Utbredningen är {:.1f} km², mer än tillåtna {:.1f} km². Alla punkter hålls i "
-            "minnet (ungefär 300 MB per km²), så dela upp området eller höj gränsen under "
-            "Avancerat.".format(area_km2, max_area_km2)
+            "minnet (ungefär 100-150 MB per km²), så dela upp området eller höj gränsen "
+            "under Avancerat.".format(area_km2, max_area_km2)
         )
+    if raw_folder and not os.path.isdir(raw_folder):
+        raise ValueError("Mappen för punktfiler finns inte: {}".format(raw_folder))
 
-    wgs = aoi.projectAs(arcpy.SpatialReference(WGS84_WKID)).extent
-    arcpy.SetProgressor("default", "Söker rutor i Lantmäteriets STAC-katalog...")
+    steps = _Steps(8, messages)
     try:
+        steps.next("söker rutor i Lantmäteriets STAC-katalog")
+        wgs = aoi.projectAs(arcpy.SpatialReference(4326)).extent
         items = _stac_search((wgs.XMin, wgs.YMin, wgs.XMax, wgs.YMax))
         tiles = _pick_tiles(items, aoi)
         if not tiles:
@@ -490,25 +807,68 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2, messages
                 "Inga laserdata för området. Laserdata Skog täcker ungefär 75 % av Sverige, "
                 "men inte fjällen."
             )
-        years = sorted({t["datetime"][:4] for t in tiles if t["datetime"]})
-        messages.addMessage("{} ruta/rutor: {} (insamlingsår {}).".format(
-            len(tiles), ", ".join(t["id"] for t in tiles), ", ".join(years) or "okänt"))
-        if len(years) > 1:
+        for t in tiles:
+            t["bounds"], frac = _read_bounds(t, ext)
+            t["expected"] = t["count"] * frac
+        expected = sum(t["expected"] for t in tiles)
+        steps.done("{} ruta/rutor. Ungefär {} miljoner punkter väntas, cirka {:.1f} GB "
+                   "minne.".format(len(tiles), _fmt_count(expected / 1e6),
+                                   expected * BYTES_PER_POINT / 1e9))
+        for t in tiles:
+            messages.addMessage("    {}: skanningsområde {}, insamlad {}.".format(
+                t["id"], t["area"] or "okänt", _capture_period(t)))
+        if len({_capture_period(t) for t in tiles}) > 1:
             messages.addWarningMessage(
-                "Rutorna är skannade olika år. Höjdskillnaden kan ha en skarv vid rutgränsen."
+                "Rutorna är skannade vid olika tillfällen. Höjdskillnaden kan ha en skarv vid "
+                "rutgränsen, särskilt om årstid eller år skiljer sig."
             )
 
-        arcpy.SetProgressorLabel("Hämtar token...")
+        steps.next("hämtar token och kontrollerar behörighet")
         token = _get_token(key, secret)
+        token_time = time.time()
         _check_access(tiles[0]["href"], token)
-
         pdal = _import_pdal()
-        arcpy.SetProgressorLabel("Läser punkter inom området...")
-        t0 = time.time()
-        points = _read_points(pdal, tiles, token, ext)
-        messages.addMessage("Läste {:,} punkter på {:.0f} s.".format(len(points), time.time() - t0)
-                            .replace(",", " "))
-        if len(points) == 0:
+        steps.done()
+
+        steps.next("läser punkter, {} ruta/rutor".format(len(tiles)))
+        arcpy.SetProgressor("step", "", 0, 100, 1)
+        arrays = []
+        n_total = 0
+        done_expected = 0.0
+        t_read = time.time()
+        for i, t in enumerate(tiles, 1):
+            eta = ""
+            if done_expected > 0:
+                rate = (time.time() - t_read) / done_expected
+                eta = ", ca {} kvar".format(_fmt_duration(rate * (expected - done_expected)))
+            steps.label("läser ruta {} av {} ({}){}".format(i, len(tiles), t["id"], eta))
+
+            if time.time() - token_time > TOKEN_MAX_AGE_S:
+                token = _get_token(key, secret)
+                token_time = time.time()
+
+            t0 = time.time()
+            pts = _read_tile(pdal, t, token, t["bounds"])
+            msg = "    Ruta {} av {} ({}): {} punkter på {}".format(
+                i, len(tiles), t["id"], _fmt_count(len(pts)), _fmt_duration(time.time() - t0))
+
+            if raw_folder and len(pts):
+                path = os.path.join(raw_folder, "{}_{}{}".format(prefix, t["id"], raw_ext))
+                steps.label("sparar punkter för ruta {} av {}".format(i, len(tiles)))
+                _write_points(pdal, pts, path.replace("\\", "/"))
+                msg += ", sparade {} ({:.0f} MB)".format(
+                    os.path.basename(path), os.path.getsize(path) / 1e6)
+
+            pts = pts[~np.isin(pts["Classification"], NOISE_CLASSES)]
+            if len(pts):
+                arrays.append(pts)
+                n_total += len(pts)
+            messages.addMessage(msg + ".")
+
+            done_expected += t["expected"]
+            arcpy.SetProgressorPosition(min(100, int(100 * done_expected / max(expected, 1))))
+        steps.done("{} punkter efter att brus tagits bort.".format(_fmt_count(n_total)))
+        if n_total == 0:
             raise ValueError("Inga punkter inom området.")
 
         grid = _grid(ext, cell)
@@ -516,17 +876,27 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2, messages
         tmp_dsm = os.path.join(scratch, "lds_dsm.tif").replace("\\", "/")
         tmp_dtm = os.path.join(scratch, "lds_dtm.tif").replace("\\", "/")
         tmp_diff = os.path.join(scratch, "lds_diff.tif")
+        cells = grid["width"] * grid["height"]
 
-        arcpy.SetProgressorLabel("Skapar DSM...")
-        _write_dsm(pdal, points, grid, tmp_dsm)
-        arcpy.SetProgressorLabel("Skapar DTM...")
-        _write_dtm(pdal, points, grid, tmp_dtm)
-        del points
+        steps.next("skapar DSM av {} punkter i {} celler (inget delförlopp tillgängligt)".format(
+            _fmt_count(n_total), _fmt_count(cells)))
+        _write_dsm(pdal, arrays, grid, tmp_dsm)
+        ground = np.concatenate([a[a["Classification"] == CLASS_GROUND] for a in arrays])
+        del arrays
+        steps.done()
 
-        arcpy.SetProgressorLabel("Beräknar höjdskillnad...")
+        steps.next("skapar DTM genom att triangulera {} markpunkter (inget delförlopp "
+                   "tillgängligt)".format(_fmt_count(len(ground))))
+        _write_dtm(pdal, ground, grid, tmp_dtm)
+        n_ground = len(ground)
+        del ground
+        steps.done()
+
+        steps.next("beräknar höjdskillnad")
         dsm = arcpy.RasterToNumPyArray(tmp_dsm, nodata_to_value=np.nan)
         dtm = arcpy.RasterToNumPyArray(tmp_dtm, nodata_to_value=np.nan)
         diff = dsm - dtm
+        del dsm, dtm
         # Små negativa värden är mätbrus (DSM:ens högsta punkt under TIN:en).
         diff = np.where(diff < 0, 0, diff)
         diff = np.where(np.isnan(diff), NODATA, diff).astype(np.float32)
@@ -540,21 +910,32 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2, messages
             arcpy.NumPyArrayToRaster(
                 diff, arcpy.Point(grid["origin_x"], grid["origin_y"]), cell, cell, NODATA
             ).save(tmp_diff)
+            del diff
+            steps.done()
 
+            steps.next("klipper rastren till intresseområdet och skriver metadata")
             clip_fc = arcpy.management.CopyFeatures([aoi], r"memory\lds_aoi")[0]
             rect = "{} {} {} {}".format(ext.XMin, ext.YMin, ext.XMax, ext.YMax)
+            run_info = {"extent": ext, "cell": cell, "points": n_total, "ground": n_ground,
+                        "created": datetime.date.today().isoformat()}
             outputs = []
-            for src, suffix in ((tmp_dsm, SUFFIX_DSM), (tmp_dtm, SUFFIX_DTM),
-                                (tmp_diff, SUFFIX_DIFF)):
-                arcpy.SetProgressorLabel("Klipper {}...".format(suffix))
+            jobs = ((tmp_dsm, SUFFIX_DSM), (tmp_dtm, SUFFIX_DTM), (tmp_diff, SUFFIX_DIFF))
+            for i, (src, suffix) in enumerate(jobs, 1):
+                steps.label("klipper {} ({} av {})".format(suffix, i, len(jobs)))
                 dst = _out_path(workspace, prefix, suffix)
                 arcpy.management.Clip(src, rect, dst, clip_fc, str(NODATA),
                                       "ClippingGeometry", "NO_MAINTAIN_EXTENT")
                 # Clip tappar PDAL:s sammansatta koordinatsystem, sätt det igen.
                 arcpy.management.DefineProjection(dst, sr)
+                try:
+                    _write_raster_metadata(dst, suffix, tiles, run_info)
+                except Exception as exc:
+                    messages.addWarningMessage(
+                        "Kunde inte skriva metadata för {}: {}".format(os.path.basename(dst), exc))
                 outputs.append(dst)
-                messages.addMessage("Skapade {}.".format(dst))
+                messages.addMessage("    Skapade {}.".format(dst))
             arcpy.management.Delete(clip_fc)
+            steps.done()
         finally:
             arcpy.env.outputCoordinateSystem = old_ocs
             arcpy.env.overwriteOutput = old_overwrite
@@ -565,7 +946,10 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2, messages
             except Exception:
                 pass
 
+        steps.next("lägger till rastren i kartan")
         _add_to_map(outputs, messages)
+        steps.done()
+        messages.addMessage("Klart på {}.".format(_fmt_duration(time.time() - steps.t0)))
         return outputs
     finally:
         arcpy.ResetProgressor()
