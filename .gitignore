@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyt.xml
+*.lock
+*.aprx.bak
+
+# Genererade data
+*.gdb/
+*.tif
+*.tif.aux.xml
+*.ovr
+*.laz
+*.las
