@@ -133,8 +133,25 @@ TOOLTIPS = {
         "Consumer secret som hör till nyckeln. Visas dold i dialogen och skrivs aldrig till "
         "meddelandena."
     ),
+    "make_dsm": (
+        "Skapa ytmodellen: högsta laserpunkt per cell, alltså trädtoppar, tak och mark där "
+        "inget skymmer."
+    ),
+    "make_dtm": (
+        "Skapa markmodellen: markytan utan vegetation och byggnader, triangulerad från "
+        "markpunkterna."
+    ),
+    "make_diff": (
+        "Skapa höjdskillnaden DSM - DTM, i praktiken vegetationens och byggnadernas höjd "
+        "över mark. DSM och DTM beräknas då alltid, men sparas bara om de också är valda."
+    ),
+    "save_points": (
+        "Spara de lästa punkterna som filer. Kan väljas ensamt, utan några raster; då hålls "
+        "bara en ruta i taget i minnet."
+    ),
     "out_workspace": (
-        "Geodatabas eller mapp där de tre rastren sparas. I en mapp blir de GeoTIFF."
+        "Geodatabas eller mapp där de valda rastren sparas. I en mapp blir de GeoTIFF. "
+        "Behövs bara om något raster är valt."
     ),
     "prefix": (
         "Början på utdatanamnen: <prefix>_dsm, <prefix>_dtm och <prefix>_hojdskillnad. "
@@ -152,10 +169,9 @@ TOOLTIPS = {
         "datorn har minne nog."
     ),
     "raw_folder": (
-        "Valfritt. Mapp där de lästa punkterna sparas, en fil per ruta med namnet "
-        "<prefix>_<ruta>.laz eller .las. Filerna innehåller alla punkter inom områdets "
-        "utbredning (inte hela rutor) med alla klasser, även brus. Lämna tomt för att inte "
-        "spara några punkter. Undvik mappar som synkas till molnet, som OneDrive."
+        "Mapp där punkterna sparas, en fil per ruta med namnet <prefix>_<ruta>.laz eller "
+        ".las. Filerna innehåller alla punkter inom områdets utbredning (inte hela rutor) "
+        "med alla klasser, även brus. Undvik mappar som synkas till molnet, som OneDrive."
     ),
     "raw_format": (
         "Filformat för sparade punkter. LAZ är ungefär 5-7 gånger mindre men kan inte "
@@ -660,9 +676,35 @@ class HojdmodellerFranLaserdata:
             parameterType="Required", direction="Input", category="Inloggning",
         )
 
+        def checkbox(label, name, default):
+            p = arcpy.Parameter(displayName=label, name=name, datatype="GPBoolean",
+                                parameterType="Optional", direction="Input")
+            p.value = default
+            return p
+
+        p_make_dsm = checkbox("DSM (ytmodell)", "make_dsm", True)
+        p_make_dtm = checkbox("DTM (markmodell)", "make_dtm", True)
+        p_make_diff = checkbox("Höjdskillnad (DSM - DTM)", "make_diff", True)
+        p_save_pts = checkbox("Punktfiler (LAZ/LAS)", "save_points", False)
+
+        p_raw = arcpy.Parameter(
+            displayName="Mapp för punktfiler", name="raw_folder", datatype="DEFolder",
+            parameterType="Optional", direction="Input",
+        )
+        p_raw.enabled = False
+        p_raw_fmt = arcpy.Parameter(
+            displayName="Format för punktfiler", name="raw_format", datatype="GPString",
+            parameterType="Optional", direction="Input",
+        )
+        p_raw_fmt.filter.type = "ValueList"
+        p_raw_fmt.filter.list = [RAW_LAZ, RAW_LAS]
+        p_raw_fmt.value = RAW_LAZ
+        p_raw_fmt.enabled = False
+
+        # Optional i ramverket; krävs i updateMessages bara när ett raster är valt.
         p_ws = arcpy.Parameter(
-            displayName="Utdata-arbetsyta", name="out_workspace", datatype="DEWorkspace",
-            parameterType="Required", direction="Input",
+            displayName="Utdata-arbetsyta för raster", name="out_workspace",
+            datatype="DEWorkspace", parameterType="Optional", direction="Input",
         )
         default_ws = _default_workspace()
         if default_ws:
@@ -686,19 +728,6 @@ class HojdmodellerFranLaserdata:
         )
         p_max.value = DEFAULT_MAX_AREA_KM2
 
-        p_raw = arcpy.Parameter(
-            displayName="Mapp för punktfiler", name="raw_folder", datatype="DEFolder",
-            parameterType="Optional", direction="Input", category="Spara punkter",
-        )
-        p_raw_fmt = arcpy.Parameter(
-            displayName="Format för punktfiler", name="raw_format", datatype="GPString",
-            parameterType="Optional", direction="Input", category="Spara punkter",
-        )
-        p_raw_fmt.filter.type = "ValueList"
-        p_raw_fmt.filter.list = [RAW_LAZ, RAW_LAS]
-        p_raw_fmt.value = RAW_LAZ
-        p_raw_fmt.enabled = False
-
         p_out = [
             arcpy.Parameter(displayName=label, name="out_" + suffix, datatype="DERasterDataset",
                             parameterType="Derived", direction="Output")
@@ -706,72 +735,95 @@ class HojdmodellerFranLaserdata:
                                   ("Höjdskillnad", SUFFIX_DIFF))
         ]
 
-        # Nya parametrar läggs efter de gamla, så att skript som anropar
-        # verktyget med positionsargument fortsätter att fungera.
-        return [p_aoi, p_key, p_secret, p_ws, p_prefix, p_cell, p_max,
-                p_raw, p_raw_fmt] + p_out
+        return [p_aoi, p_key, p_secret, p_make_dsm, p_make_dtm, p_make_diff, p_save_pts,
+                p_raw, p_raw_fmt, p_ws, p_prefix, p_cell, p_max] + p_out
 
     def isLicensed(self):
         return True
 
     def updateParameters(self, parameters):
-        p_raw, p_raw_fmt = parameters[7], parameters[8]
-        p_raw_fmt.enabled = bool(p_raw.valueAsText)
+        p = {q.name: q for q in parameters}
+        save = bool(p["save_points"].value)
+        p["raw_folder"].enabled = save
+        p["raw_format"].enabled = save
+        rasters = any(p[n].value for n in ("make_dsm", "make_dtm", "make_diff"))
+        p["out_workspace"].enabled = rasters
+        p["cell_size"].enabled = rasters
 
     def updateMessages(self, parameters):
-        p_ws, p_prefix, p_cell, p_max, p_raw = parameters[3:8]
+        p = {q.name: q for q in parameters}
+        chosen = [s for s, n in ((SUFFIX_DSM, "make_dsm"), (SUFFIX_DTM, "make_dtm"),
+                                 (SUFFIX_DIFF, "make_diff")) if p[n].value]
+        save = bool(p["save_points"].value)
 
-        prefix = (p_prefix.valueAsText or "").strip()
+        if not chosen and not save:
+            p["make_dsm"].setErrorMessage("Välj minst en sak att skapa.")
+        if chosen and not p["out_workspace"].valueAsText:
+            p["out_workspace"].setErrorMessage("Ange var rastren ska sparas.")
+        if save and not p["raw_folder"].valueAsText:
+            p["raw_folder"].setErrorMessage("Ange en mapp för punktfilerna.")
+
+        ws = p["out_workspace"].valueAsText
+        prefix = (p["prefix"].valueAsText or "").strip()
         if prefix and not (prefix[0].isalpha() and all(c.isalnum() or c == "_" for c in prefix)):
-            p_prefix.setErrorMessage(
+            p["prefix"].setErrorMessage(
                 "Prefixet får bara innehålla bokstäver, siffror och understreck, och "
                 "måste börja med en bokstav."
             )
-        elif prefix and p_ws.valueAsText:
-            existing = [_out_path(p_ws.valueAsText, prefix, s)
-                        for s in (SUFFIX_DSM, SUFFIX_DTM, SUFFIX_DIFF)]
-            existing = [os.path.basename(p) for p in existing if arcpy.Exists(p)]
+        elif prefix and ws and chosen:
+            existing = [_out_path(ws, prefix, s) for s in chosen]
+            existing = [os.path.basename(e) for e in existing if arcpy.Exists(e)]
             if existing:
-                p_prefix.setWarningMessage("Skrivs över: " + ", ".join(existing))
+                p["prefix"].setWarningMessage("Skrivs över: " + ", ".join(existing))
 
-        if p_cell.value is not None and not (0.25 <= p_cell.value <= 50):
-            p_cell.setErrorMessage("Cellstorleken ska vara mellan 0,25 och 50 m.")
-        elif p_cell.value is not None and p_cell.value < 1:
-            p_cell.setWarningMessage(
+        cell = p["cell_size"].value
+        if cell is not None and not (0.25 <= cell <= 50):
+            p["cell_size"].setErrorMessage("Cellstorleken ska vara mellan 0,25 och 50 m.")
+        elif cell is not None and cell < 1:
+            p["cell_size"].setWarningMessage(
                 "Punkttätheten är 1-2 punkter/m². Under 1 m blir DSM:en glest fylld och "
                 "DTM:en bara interpolerad mellan markpunkterna."
             )
 
-        if p_max.value is not None and p_max.value <= 0:
-            p_max.setErrorMessage("Ange en yta större än 0.")
+        if p["max_area_km2"].value is not None and p["max_area_km2"].value <= 0:
+            p["max_area_km2"].setErrorMessage("Ange en yta större än 0.")
 
-        raw = (p_raw.valueAsText or "").lower()
-        if raw and any(h in raw for h in _SYNC_HINTS):
-            p_raw.setWarningMessage(
+        raw = (p["raw_folder"].valueAsText or "").lower()
+        if save and raw and any(h in raw for h in _SYNC_HINTS):
+            p["raw_folder"].setWarningMessage(
                 "Mappen ser ut att synkas till molnet. Punktfilerna kan bli flera GB och "
                 "skulle då laddas upp."
             )
 
     def execute(self, parameters, messages):
-        aoi = parameters[0].value
-        key = (parameters[1].valueAsText or "").strip()
-        secret = (parameters[2].valueAsText or "").strip()
-        workspace = parameters[3].valueAsText
-        prefix = parameters[4].valueAsText.strip()
-        cell = parameters[5].value or DEFAULT_CELL_SIZE
-        max_area = parameters[6].value or DEFAULT_MAX_AREA_KM2
-        raw_folder = parameters[7].valueAsText or None
-        raw_ext = RAW_EXT.get(parameters[8].valueAsText or RAW_LAZ, ".laz")
+        p = {q.name: q for q in parameters}
+        products = [s for s, n in ((SUFFIX_DSM, "make_dsm"), (SUFFIX_DTM, "make_dtm"),
+                                   (SUFFIX_DIFF, "make_diff")) if p[n].value]
+        raw_folder = p["raw_folder"].valueAsText if p["save_points"].value else None
 
         try:
-            outputs = _run(aoi, key, secret, workspace, prefix, cell, max_area,
-                           raw_folder, raw_ext, messages)
+            if p["save_points"].value and not raw_folder:
+                raise ValueError("Ange en mapp för punktfilerna.")
+            outputs = _run(
+                p["aoi"].value,
+                (p["consumer_key"].valueAsText or "").strip(),
+                (p["consumer_secret"].valueAsText or "").strip(),
+                products,
+                raw_folder,
+                RAW_EXT.get(p["raw_format"].valueAsText or RAW_LAZ, ".laz"),
+                p["out_workspace"].valueAsText,
+                p["prefix"].valueAsText.strip(),
+                p["cell_size"].value or DEFAULT_CELL_SIZE,
+                p["max_area_km2"].value or DEFAULT_MAX_AREA_KM2,
+                messages,
+            )
         except ValueError as exc:
             messages.addErrorMessage(str(exc))
             raise arcpy.ExecuteError
 
-        for i, path in enumerate(outputs):
-            arcpy.SetParameterAsText(9 + i, path)
+        names = [q.name for q in parameters]
+        for suffix, path in outputs.items():
+            arcpy.SetParameterAsText(names.index("out_" + suffix), path)
 
     def postExecute(self, parameters):
         return
@@ -781,8 +833,25 @@ class HojdmodellerFranLaserdata:
 # Körningens innehåll (separat funktion - går att testa utanför Pro)
 # =============================================================================
 
-def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2,
-         raw_folder, raw_ext, messages):
+def _run(aoi_layer, key, secret, products, raw_folder, raw_ext, workspace, prefix, cell,
+         max_area_km2, messages):
+    """
+    products: de raster som ska sparas, en delmängd av SUFFIX_DSM/DTM/DIFF.
+    raw_folder: mapp för punktfiler, eller None. Returnerar {suffix: sökväg}.
+    """
+    if not products and not raw_folder:
+        raise ValueError("Välj minst en sak att skapa: DSM, DTM, höjdskillnad eller punktfiler.")
+    if products and not workspace:
+        raise ValueError("Ange en utdata-arbetsyta för rastren.")
+    if raw_folder and not os.path.isdir(raw_folder):
+        raise ValueError("Mappen för punktfiler finns inte: {}".format(raw_folder))
+
+    # Höjdskillnaden räknas ur DSM och DTM, så de skapas internt även om de
+    # inte ska sparas.
+    need_dsm = SUFFIX_DSM in products or SUFFIX_DIFF in products
+    need_dtm = SUFFIX_DTM in products or SUFFIX_DIFF in products
+    need_diff = SUFFIX_DIFF in products
+
     aoi = _aoi_geometry(aoi_layer)
     ext = aoi.extent
     area_km2 = (ext.XMax - ext.XMin) * (ext.YMax - ext.YMin) / 1e6
@@ -793,10 +862,12 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2,
             "minnet (ungefär 100-150 MB per km²), så dela upp området eller höj gränsen "
             "under Avancerat.".format(area_km2, max_area_km2)
         )
-    if raw_folder and not os.path.isdir(raw_folder):
-        raise ValueError("Mappen för punktfiler finns inte: {}".format(raw_folder))
+    wanted = [{SUFFIX_DSM: "DSM", SUFFIX_DTM: "DTM", SUFFIX_DIFF: "höjdskillnad"}[s]
+              for s in products] + (["punktfiler"] if raw_folder else [])
+    messages.addMessage("Skapar: {}.".format(", ".join(wanted)))
 
-    steps = _Steps(8, messages)
+    n_steps = 3 + need_dsm + need_dtm + need_diff + (2 if products else 0)
+    steps = _Steps(n_steps, messages)
     try:
         steps.next("söker rutor i Lantmäteriets STAC-katalog")
         wgs = aoi.projectAs(arcpy.SpatialReference(4326)).extent
@@ -811,15 +882,16 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2,
             t["bounds"], frac = _read_bounds(t, ext)
             t["expected"] = t["count"] * frac
         expected = sum(t["expected"] for t in tiles)
-        steps.done("{} ruta/rutor. Ungefär {} miljoner punkter väntas, cirka {:.1f} GB "
-                   "minne.".format(len(tiles), _fmt_count(expected / 1e6),
-                                   expected * BYTES_PER_POINT / 1e9))
+        mem = "cirka {:.1f} GB minne".format(expected * BYTES_PER_POINT / 1e9) if products \
+            else "en ruta i taget i minnet"
+        steps.done("{} ruta/rutor. Ungefär {} miljoner punkter väntas, {}.".format(
+            len(tiles), _fmt_count(expected / 1e6), mem))
         for t in tiles:
             messages.addMessage("    {}: skanningsområde {}, insamlad {}.".format(
                 t["id"], t["area"] or "okänt", _capture_period(t)))
         if len({_capture_period(t) for t in tiles}) > 1:
             messages.addWarningMessage(
-                "Rutorna är skannade vid olika tillfällen. Höjdskillnaden kan ha en skarv vid "
+                "Rutorna är skannade vid olika tillfällen. Rastren kan ha en skarv vid "
                 "rutgränsen, särskilt om årstid eller år skiljer sig."
             )
 
@@ -834,6 +906,7 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2,
         arcpy.SetProgressor("step", "", 0, 100, 1)
         arrays = []
         n_total = 0
+        n_read = 0
         done_expected = 0.0
         t_read = time.time()
         for i, t in enumerate(tiles, 1):
@@ -849,6 +922,7 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2,
 
             t0 = time.time()
             pts = _read_tile(pdal, t, token, t["bounds"])
+            n_read += len(pts)
             msg = "    Ruta {} av {} ({}): {} punkter på {}".format(
                 i, len(tiles), t["id"], _fmt_count(len(pts)), _fmt_duration(time.time() - t0))
 
@@ -859,47 +933,49 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2,
                 msg += ", sparade {} ({:.0f} MB)".format(
                     os.path.basename(path), os.path.getsize(path) / 1e6)
 
-            pts = pts[~np.isin(pts["Classification"], NOISE_CLASSES)]
-            if len(pts):
-                arrays.append(pts)
-                n_total += len(pts)
+            if products:
+                pts = pts[~np.isin(pts["Classification"], NOISE_CLASSES)]
+                if len(pts):
+                    arrays.append(pts)
+                    n_total += len(pts)
+            del pts
             messages.addMessage(msg + ".")
 
             done_expected += t["expected"]
             arcpy.SetProgressorPosition(min(100, int(100 * done_expected / max(expected, 1))))
-        steps.done("{} punkter efter att brus tagits bort.".format(_fmt_count(n_total)))
-        if n_total == 0:
+        if n_read == 0:
             raise ValueError("Inga punkter inom området.")
+        if not products:
+            steps.done("{} punkter sparade.".format(_fmt_count(n_read)))
+            messages.addMessage("Klart på {}.".format(_fmt_duration(time.time() - steps.t0)))
+            return {}
+        steps.done("{} punkter efter att brus tagits bort.".format(_fmt_count(n_total)))
 
         grid = _grid(ext, cell)
         scratch = arcpy.env.scratchFolder
-        tmp_dsm = os.path.join(scratch, "lds_dsm.tif").replace("\\", "/")
-        tmp_dtm = os.path.join(scratch, "lds_dtm.tif").replace("\\", "/")
-        tmp_diff = os.path.join(scratch, "lds_diff.tif")
+        tmp = {SUFFIX_DSM: os.path.join(scratch, "lds_dsm.tif").replace("\\", "/"),
+               SUFFIX_DTM: os.path.join(scratch, "lds_dtm.tif").replace("\\", "/"),
+               SUFFIX_DIFF: os.path.join(scratch, "lds_diff.tif")}
         cells = grid["width"] * grid["height"]
 
-        steps.next("skapar DSM av {} punkter i {} celler (inget delförlopp tillgängligt)".format(
-            _fmt_count(n_total), _fmt_count(cells)))
-        _write_dsm(pdal, arrays, grid, tmp_dsm)
-        ground = np.concatenate([a[a["Classification"] == CLASS_GROUND] for a in arrays])
+        ground = None
+        if need_dtm:
+            ground = np.concatenate([a[a["Classification"] == CLASS_GROUND] for a in arrays])
+        if need_dsm:
+            steps.next("skapar DSM av {} punkter i {} celler (inget delförlopp "
+                       "tillgängligt)".format(_fmt_count(n_total), _fmt_count(cells)))
+            _write_dsm(pdal, arrays, grid, tmp[SUFFIX_DSM])
+            steps.done()
         del arrays
-        steps.done()
 
-        steps.next("skapar DTM genom att triangulera {} markpunkter (inget delförlopp "
-                   "tillgängligt)".format(_fmt_count(len(ground))))
-        _write_dtm(pdal, ground, grid, tmp_dtm)
-        n_ground = len(ground)
+        n_ground = 0
+        if need_dtm:
+            n_ground = len(ground)
+            steps.next("skapar DTM genom att triangulera {} markpunkter (inget delförlopp "
+                       "tillgängligt)".format(_fmt_count(n_ground)))
+            _write_dtm(pdal, ground, grid, tmp[SUFFIX_DTM])
+            steps.done()
         del ground
-        steps.done()
-
-        steps.next("beräknar höjdskillnad")
-        dsm = arcpy.RasterToNumPyArray(tmp_dsm, nodata_to_value=np.nan)
-        dtm = arcpy.RasterToNumPyArray(tmp_dtm, nodata_to_value=np.nan)
-        diff = dsm - dtm
-        del dsm, dtm
-        # Små negativa värden är mätbrus (DSM:ens högsta punkt under TIN:en).
-        diff = np.where(diff < 0, 0, diff)
-        diff = np.where(np.isnan(diff), NODATA, diff).astype(np.float32)
 
         sr = arcpy.SpatialReference(SWEREF99TM_WKID, RH2000_WKID)
         old_ocs = arcpy.env.outputCoordinateSystem
@@ -907,23 +983,32 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2,
         try:
             arcpy.env.outputCoordinateSystem = sr
             arcpy.env.overwriteOutput = True
-            arcpy.NumPyArrayToRaster(
-                diff, arcpy.Point(grid["origin_x"], grid["origin_y"]), cell, cell, NODATA
-            ).save(tmp_diff)
-            del diff
-            steps.done()
+
+            if need_diff:
+                steps.next("beräknar höjdskillnad")
+                dsm = arcpy.RasterToNumPyArray(tmp[SUFFIX_DSM], nodata_to_value=np.nan)
+                dtm = arcpy.RasterToNumPyArray(tmp[SUFFIX_DTM], nodata_to_value=np.nan)
+                diff = dsm - dtm
+                del dsm, dtm
+                # Små negativa värden är mätbrus (DSM:ens högsta punkt under TIN:en).
+                diff = np.where(diff < 0, 0, diff)
+                diff = np.where(np.isnan(diff), NODATA, diff).astype(np.float32)
+                arcpy.NumPyArrayToRaster(
+                    diff, arcpy.Point(grid["origin_x"], grid["origin_y"]), cell, cell, NODATA
+                ).save(tmp[SUFFIX_DIFF])
+                del diff
+                steps.done()
 
             steps.next("klipper rastren till intresseområdet och skriver metadata")
             clip_fc = arcpy.management.CopyFeatures([aoi], r"memory\lds_aoi")[0]
             rect = "{} {} {} {}".format(ext.XMin, ext.YMin, ext.XMax, ext.YMax)
             run_info = {"extent": ext, "cell": cell, "points": n_total, "ground": n_ground,
                         "created": datetime.date.today().isoformat()}
-            outputs = []
-            jobs = ((tmp_dsm, SUFFIX_DSM), (tmp_dtm, SUFFIX_DTM), (tmp_diff, SUFFIX_DIFF))
-            for i, (src, suffix) in enumerate(jobs, 1):
-                steps.label("klipper {} ({} av {})".format(suffix, i, len(jobs)))
+            outputs = {}
+            for i, suffix in enumerate(products, 1):
+                steps.label("klipper {} ({} av {})".format(suffix, i, len(products)))
                 dst = _out_path(workspace, prefix, suffix)
-                arcpy.management.Clip(src, rect, dst, clip_fc, str(NODATA),
+                arcpy.management.Clip(tmp[suffix], rect, dst, clip_fc, str(NODATA),
                                       "ClippingGeometry", "NO_MAINTAIN_EXTENT")
                 # Clip tappar PDAL:s sammansatta koordinatsystem, sätt det igen.
                 arcpy.management.DefineProjection(dst, sr)
@@ -932,7 +1017,7 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2,
                 except Exception as exc:
                     messages.addWarningMessage(
                         "Kunde inte skriva metadata för {}: {}".format(os.path.basename(dst), exc))
-                outputs.append(dst)
+                outputs[suffix] = dst
                 messages.addMessage("    Skapade {}.".format(dst))
             arcpy.management.Delete(clip_fc)
             steps.done()
@@ -940,14 +1025,15 @@ def _run(aoi_layer, key, secret, workspace, prefix, cell, max_area_km2,
             arcpy.env.outputCoordinateSystem = old_ocs
             arcpy.env.overwriteOutput = old_overwrite
 
-        for p in (tmp_dsm, tmp_dtm, tmp_diff):
+        for path in tmp.values():
             try:
-                arcpy.management.Delete(p)
+                if arcpy.Exists(path):
+                    arcpy.management.Delete(path)
             except Exception:
                 pass
 
         steps.next("lägger till rastren i kartan")
-        _add_to_map(outputs, messages)
+        _add_to_map(list(outputs.values()), messages)
         steps.done()
         messages.addMessage("Klart på {}.".format(_fmt_duration(time.time() - steps.t0)))
         return outputs

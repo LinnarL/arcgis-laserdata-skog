@@ -1,7 +1,8 @@
 # Laserdata Skog
 
-ArcGIS Pro Python toolbox that builds three height rasters for an area of interest from
-Lantmäteriet's Laserdata Nedladdning, skog:
+ArcGIS Pro Python toolbox that builds height rasters for an area of interest from
+Lantmäteriet's Laserdata Nedladdning, skog, and optionally saves the points as LAZ or LAS.
+Each product has its own checkbox:
 
 - **DSM** (ytmodell): highest point per cell.
 - **DTM** (markmodell): ground points triangulated and rasterised, so it has no gaps.
@@ -36,12 +37,16 @@ never has to open the point cloud.
 |---|---|---|
 | Intresseområde | - | Polygon layer in any coordinate system. All features, or the selection, are merged |
 | Consumer key / Consumer secret | - | Under Inloggning. The secret is a hidden field |
-| Utdata-arbetsyta | project geodatabase | Geodatabase or folder. In a folder the rasters are GeoTIFF |
+| DSM (ytmodell) | on | Checkbox |
+| DTM (markmodell) | on | Checkbox |
+| Höjdskillnad (DSM - DTM) | on | Checkbox. DSM and DTM are always computed for it, but only saved if also ticked |
+| Punktfiler (LAZ/LAS) | off | Checkbox. Can be the only choice, then only one tile at a time is held in memory |
+| Mapp för punktfiler | - | Enabled when Punktfiler is ticked. One file per tile: `<prefix>_<tile>.laz` or `.las`. Only the area's bounding box, not whole tiles, all classes including noise |
+| Format för punktfiler | LAZ | LAZ is 5-7 times smaller but cannot be opened in Pro on a Basic licence. LAS can be added straight to a map |
+| Utdata-arbetsyta för raster | project geodatabase | Geodatabase or folder, needed when a raster is ticked. In a folder the rasters are GeoTIFF |
 | Namnprefix | `laser` | Outputs are `<prefix>_dsm`, `<prefix>_dtm`, `<prefix>_hojdskillnad`. Existing ones are overwritten, with a warning in the dialog |
 | Cellstorlek (m) | 1 | Under Avancerat |
-| Största tillåtna yta (km²) | 10 | Under Avancerat. All points are held in memory, about 100-150 MB per km² of bounding box |
-| Mapp för punktfiler | - | Under Spara punkter. Optional. Saves the points read, one file per tile: `<prefix>_<tile>.laz` or `.las`. Only the area's bounding box, not whole tiles, all classes including noise |
-| Format för punktfiler | LAZ | LAZ is 5-7 times smaller but cannot be opened in Pro on a Basic licence. LAS can be added straight to a map |
+| Största tillåtna yta (km²) | 10 | Under Avancerat. All points are held in memory while rasters are built, about 100-150 MB per km² of bounding box |
 
 Every parameter has a tooltip in the dialog. The text lives in `TOOLTIPS` in the `.pyt`, which
 writes it to `LaserdataSkog.HojdmodellerFranLaserdata.pyt.xml` when the toolbox loads.
