@@ -103,6 +103,9 @@ SUFFIX_DSM = "dsm"
 SUFFIX_DTM = "dtm"
 SUFFIX_DIFF = "hojdskillnad"
 
+AOI_POLYGONS = "Polygoner i ett lager"
+AOI_EXTENT = "Utbredning (kartvy, lager eller koordinater)"
+
 RAW_LAZ = "LAZ (komprimerad)"
 RAW_LAS = "LAS (okomprimerad, kan öppnas i ArcGIS Pro)"
 RAW_EXT = {RAW_LAZ: ".laz", RAW_LAS: ".las"}
@@ -119,11 +122,22 @@ TOOL_SUMMARY = (
 
 # Verktygstips per parameter, visas i verktygsdialogen. Se _write_tool_metadata.
 TOOLTIPS = {
+    "aoi_mode": (
+        "Hur området avgränsas. 'Polygoner i ett lager' klipper resultatet till själva "
+        "polygonerna. 'Utbredning' ger en rektangel: aktuell kartvy, utbredningen av ett "
+        "lager, en ritad rektangel eller inskrivna koordinater."
+    ),
     "aoi": (
         "Polygonlager som avgränsar området. Alla objekt i lagret slås ihop, eller bara de "
         "valda om det finns ett urval. Lagret kan ha vilket koordinatsystem som helst. "
         "Punkter hämtas inom polygonernas utbredning (bounding box), rastren klipps sedan "
         "till själva polygonerna."
+    ),
+    "aoi_extent": (
+        "Rektangel som avgränsar området. I listan kan du välja kartvyns aktuella "
+        "utbredning, eller ett lager för att använda dess utbredning. Du kan också rita en "
+        "rektangel i kartan eller skriva in koordinater. Inskrivna koordinater tolkas i den "
+        "aktiva kartans koordinatsystem; vilket som användes står i meddelandena."
     ),
     "consumer_key": (
         "Consumer key från Lantmäteriets API-portal. Nyckeln behöver både API:et STAC-hojd "
@@ -344,6 +358,67 @@ def _aoi_geometry(aoi_layer):
     if geom is None:
         raise ValueError("Intresseområdet innehåller inga polygoner med yta.")
     return geom
+
+
+def _active_map_sr():
+    try:
+        m = arcpy.mp.ArcGISProject("CURRENT").activeMap
+        if m is not None and m.spatialReference is not None:
+            return m.spatialReference, m.name
+    except Exception:
+        pass
+    return None, None
+
+
+def _aoi_from_extent(value, text, messages):
+    """
+    En GPExtent-parameter som polygon i SWEREF 99 TM.
+
+    .value är ett geoprocessing-extentobjekt, inte arcpy.Extent. Hörnen är
+    vanliga tal. Koordinatsystemet följer bara med när utbredningen kommer från
+    ett lager eller en datakälla, och då bara som WKT2 i valueAsText efter de
+    fyra talen. Inskrivna koordinater har inget; de tolkas i den aktiva kartans
+    koordinatsystem, eftersom en utbredning vald i dialogen anges i kartans
+    koordinater.
+    """
+    xmin, ymin, xmax, ymax = (float(value.XMin), float(value.YMin),
+                              float(value.XMax), float(value.YMax))
+    if not (xmax > xmin and ymax > ymin):
+        raise ValueError("Utbredningen har ingen yta.")
+
+    sr = None
+    parts = (text or "").split(" ", 4)
+    if len(parts) == 5 and parts[4].strip():
+        sr = arcpy.SpatialReference()
+        try:
+            sr.loadFromString(parts[4].strip())
+        except Exception:
+            sr = None
+    if sr is not None and (sr.factoryCode or sr.exportToString()):
+        source = "utbredningens eget koordinatsystem"
+    else:
+        sr, map_name = _active_map_sr()
+        if sr is not None and (sr.factoryCode or sr.exportToString()):
+            source = "den aktiva kartans koordinatsystem ({})".format(map_name)
+        else:
+            sr = arcpy.SpatialReference(SWEREF99TM_WKID)
+            source = "ingen aktiv karta, så SWEREF 99 TM antas"
+    messages.addMessage("Utbredningen tolkas i {}: {}.".format(sr.name, source))
+
+    # Förtäta kanterna, så att en utbredning i grader eller ett annat system
+    # inte blir en för liten fyrhörning efter omprojicering.
+    n = 16
+    pts = ([(xmin + (xmax - xmin) * i / n, ymin) for i in range(n)]
+           + [(xmax, ymin + (ymax - ymin) * i / n) for i in range(n)]
+           + [(xmax - (xmax - xmin) * i / n, ymax) for i in range(n)]
+           + [(xmin, ymax - (ymax - ymin) * i / n) for i in range(n)])
+    poly = arcpy.Polygon(arcpy.Array([arcpy.Point(x, y) for x, y in pts]), sr)
+    tm = arcpy.SpatialReference(SWEREF99TM_WKID)
+    if sr.factoryCode != SWEREF99TM_WKID:
+        poly = poly.projectAs(tm)
+    if poly is None or poly.area <= 0:
+        raise ValueError("Utbredningen kunde inte omvandlas till SWEREF 99 TM.")
+    return poly
 
 
 def _grid(extent, cell):
@@ -661,11 +736,26 @@ class HojdmodellerFranLaserdata:
         self.canRunInBackground = False
 
     def getParameterInfo(self):
-        p_aoi = arcpy.Parameter(
-            displayName="Intresseområde", name="aoi", datatype="GPFeatureLayer",
+        p_mode = arcpy.Parameter(
+            displayName="Avgränsa området med", name="aoi_mode", datatype="GPString",
             parameterType="Required", direction="Input",
         )
+        p_mode.filter.type = "ValueList"
+        p_mode.filter.list = [AOI_POLYGONS, AOI_EXTENT]
+        p_mode.value = AOI_POLYGONS
+
+        # Båda är Optional i ramverket; updateMessages kräver den som valts.
+        p_aoi = arcpy.Parameter(
+            displayName="Intresseområde (polygoner)", name="aoi", datatype="GPFeatureLayer",
+            parameterType="Optional", direction="Input",
+        )
         p_aoi.filter.list = ["Polygon"]
+
+        p_extent = arcpy.Parameter(
+            displayName="Utbredning", name="aoi_extent", datatype="GPExtent",
+            parameterType="Optional", direction="Input",
+        )
+        p_extent.enabled = False
 
         p_key = arcpy.Parameter(
             displayName="Consumer key", name="consumer_key", datatype="GPString",
@@ -735,7 +825,7 @@ class HojdmodellerFranLaserdata:
                                   ("Höjdskillnad", SUFFIX_DIFF))
         ]
 
-        return [p_aoi, p_key, p_secret, p_make_dsm, p_make_dtm, p_make_diff, p_save_pts,
+        return [p_mode, p_aoi, p_extent, p_key, p_secret, p_make_dsm, p_make_dtm, p_make_diff, p_save_pts,
                 p_raw, p_raw_fmt, p_ws, p_prefix, p_cell, p_max] + p_out
 
     def isLicensed(self):
@@ -743,6 +833,9 @@ class HojdmodellerFranLaserdata:
 
     def updateParameters(self, parameters):
         p = {q.name: q for q in parameters}
+        by_extent = p["aoi_mode"].valueAsText == AOI_EXTENT
+        p["aoi"].enabled = not by_extent
+        p["aoi_extent"].enabled = by_extent
         save = bool(p["save_points"].value)
         p["raw_folder"].enabled = save
         p["raw_format"].enabled = save
@@ -755,6 +848,12 @@ class HojdmodellerFranLaserdata:
         chosen = [s for s, n in ((SUFFIX_DSM, "make_dsm"), (SUFFIX_DTM, "make_dtm"),
                                  (SUFFIX_DIFF, "make_diff")) if p[n].value]
         save = bool(p["save_points"].value)
+
+        if p["aoi_mode"].valueAsText == AOI_EXTENT:
+            if not p["aoi_extent"].valueAsText:
+                p["aoi_extent"].setErrorMessage("Ange en utbredning.")
+        elif not p["aoi"].valueAsText:
+            p["aoi"].setErrorMessage("Ange ett polygonlager.")
 
         if not chosen and not save:
             p["make_dsm"].setErrorMessage("Välj minst en sak att skapa.")
@@ -804,8 +903,17 @@ class HojdmodellerFranLaserdata:
         try:
             if p["save_points"].value and not raw_folder:
                 raise ValueError("Ange en mapp för punktfilerna.")
+            if p["aoi_mode"].valueAsText == AOI_EXTENT:
+                if not p["aoi_extent"].valueAsText:
+                    raise ValueError("Ange en utbredning.")
+                aoi = _aoi_from_extent(p["aoi_extent"].value, p["aoi_extent"].valueAsText,
+                                       messages)
+            else:
+                if not p["aoi"].valueAsText:
+                    raise ValueError("Ange ett polygonlager.")
+                aoi = _aoi_geometry(p["aoi"].value)
             outputs = _run(
-                p["aoi"].value,
+                aoi,
                 (p["consumer_key"].valueAsText or "").strip(),
                 (p["consumer_secret"].valueAsText or "").strip(),
                 products,
@@ -833,9 +941,10 @@ class HojdmodellerFranLaserdata:
 # Körningens innehåll (separat funktion - går att testa utanför Pro)
 # =============================================================================
 
-def _run(aoi_layer, key, secret, products, raw_folder, raw_ext, workspace, prefix, cell,
+def _run(aoi, key, secret, products, raw_folder, raw_ext, workspace, prefix, cell,
          max_area_km2, messages):
     """
+    aoi: polygon i SWEREF 99 TM (från _aoi_geometry eller _aoi_from_extent).
     products: de raster som ska sparas, en delmängd av SUFFIX_DSM/DTM/DIFF.
     raw_folder: mapp för punktfiler, eller None. Returnerar {suffix: sökväg}.
     """
@@ -852,7 +961,6 @@ def _run(aoi_layer, key, secret, products, raw_folder, raw_ext, workspace, prefi
     need_dtm = SUFFIX_DTM in products or SUFFIX_DIFF in products
     need_diff = SUFFIX_DIFF in products
 
-    aoi = _aoi_geometry(aoi_layer)
     ext = aoi.extent
     area_km2 = (ext.XMax - ext.XMin) * (ext.YMax - ext.YMin) / 1e6
     messages.addMessage("Intresseområdets utbredning: {:.2f} km² (SWEREF 99 TM).".format(area_km2))

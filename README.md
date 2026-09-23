@@ -35,7 +35,9 @@ never has to open the point cloud.
 
 | Parameter | Default | Notes |
 |---|---|---|
-| Intresseområde | - | Polygon layer in any coordinate system. All features, or the selection, are merged |
+| Avgränsa området med | Polygoner i ett lager | Choose between a polygon layer and an extent |
+| Intresseområde (polygoner) | - | Polygon layer in any coordinate system. All features, or the selection, are merged, and the rasters are clipped to the shapes |
+| Utbredning | - | Rectangle: current display extent, a layer's extent, a drawn rectangle or typed coordinates. Typed coordinates are read in the active map's coordinate system; the log says which one was used |
 | Consumer key / Consumer secret | - | Under Inloggning. The secret is a hidden field |
 | DSM (ytmodell) | on | Checkbox |
 | DTM (markmodell) | on | Checkbox |
